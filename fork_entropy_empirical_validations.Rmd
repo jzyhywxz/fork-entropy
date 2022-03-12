@@ -11,7 +11,9 @@ knitr::opts_chunk$set(echo = TRUE)
 
 ## Setting up Packages
 
-```{r library, tidy=TRUE}
+We set up required packages here.
+
+```{r library, tidy=TRUE, include=FALSE}
 library("dplyr")
 library("tidyverse")    # needed for data manipulation
 library("knitr")
@@ -24,6 +26,13 @@ library("pscl")
 library("sjstats")
 library("emmeans")      # for interaction analysis
 library("ggplot2")
+library("MASS")
+library("mlmRev")
+library("agridat")
+library("MCMCglmm")
+library("scapeMCMC")
+library("see")
+library("patchwork")
 ```
 
 ## Loading Dataset
@@ -50,43 +59,60 @@ get_sample_count_of_each_project <- function(data) {
 get_sample_count_of_each_project(raw_data)
 ```
 
-## Data Preprocessing
+## Removing Outliers & Transforming Data
 
-For variables applied by log-transform, we compute half the minimum values of variables grater than zero.
+```{r remove_outliers_0, tidy=TRUE}
+nic.q <- quantile(raw_data$num_integrated_commits, 0.995)
+print(paste("99.5% quantile of num_integrated_commits is ", nic.q, sep = ""))
+nbi.q <- quantile(raw_data$num_bug_report_issues, 0.995)
+print(paste("99.5% quantile of num_bug_report_issues is ", nbi.q, sep = ""))
 
-```{r transform_data_0, tidy=TRUE}
+summary(filter(
+  raw_data,
+  num_integrated_commits < nic.q,
+  num_bug_report_issues < nbi.q)$num_stars)
 m <- min(filter(
-  raw_data, ratio_old_volunteers > 0)$ratio_old_volunteers) / 2
-print(paste("ratio_old_volunteers: ", m, sep = ""))
-
+  raw_data,
+  ratio_old_volunteers > 0,
+  num_integrated_commits < nic.q,
+  num_bug_report_issues < nbi.q)$ratio_old_volunteers) / 2
+print(paste("small delta of ratio_old_volunteers is ", m, sep = ""))
 m <- min(filter(
-  raw_data, ratio_old_volunteers_rq2 > 0)$ratio_old_volunteers_rq2) / 2
-print(paste("ratio_old_volunteers_rq2: ", m, sep = ""))
-
+  raw_data,
+  ratio_old_volunteers_rq2 > 0,
+  num_integrated_commits < nic.q,
+  num_bug_report_issues < nbi.q)$ratio_old_volunteers_rq2) / 2
+print(paste("small delta of ratio_old_volunteers_rq2 is ", m, sep = ""))
 m <- min(filter(
-  raw_data, ratio_prs_with_hot_files > 0)$ratio_prs_with_hot_files) / 2
-print(paste("ratio_prs_with_hot_files: ", m, sep = ""))
+  raw_data,
+  ratio_prs_with_hot_files > 0,
+  num_integrated_commits < nic.q,
+  num_bug_report_issues < nbi.q)$ratio_prs_with_hot_files) / 2
+print(paste("small delta of ratio_prs_with_hot_files is ", m, sep = ""))
 ```
 
-
-```{r transform_data_1, tidy=TRUE}
-exp_data <- raw_data %>% mutate(
+```{r remove_outliers_1, tidy=TRUE}
+exp_data <- raw_data %>% filter(
+  num_integrated_commits < nic.q,
+  num_bug_report_issues < nbi.q) %>% mutate(
   num_forks_log_scale = scale(log(num_forks)),
   num_files_log_scale = scale(log(num_files)),
   project_age_scale = scale(project_age),
   num_stars_log_scale = scale(log(num_stars + 0.5)),
   ratio_old_volunteers_log_scale = scale(log(ratio_old_volunteers + 5e-4)),
   fork_entropy_scale = scale(fork_entropy),
-  num_integrated_commits_log = log(num_integrated_commits + 0.5),
+  num_integrated_commits.t = num_integrated_commits + 1,
   num_forks_rq2_log_scale = scale(log(num_forks_rq2)),
   num_files_rq2_log_scale = scale(log(num_files_rq2)),
-  ratio_old_volunteers_rq2_log_scale = 
-    scale(log(ratio_old_volunteers_rq2 + 1e-3)),
+  ratio_old_volunteers_rq2_log_scale =  scale(log(ratio_old_volunteers_rq2 + 1e-3)),
   ratio_prs_with_tests_scale = scale(ratio_prs_with_tests),
-  ratio_prs_with_hot_files_log_scale = 
-    scale(log(ratio_prs_with_hot_files + 8e-3)),
+  ratio_prs_with_hot_files_scale = scale(ratio_prs_with_hot_files),
   fork_entropy_rq2_scale = scale(fork_entropy_rq2),
-  num_bug_report_issues_log = log(num_bug_report_issues + 0.5))
+  num_bug_report_issues.t = num_bug_report_issues + 1)
+
+get_sample_count_of_each_project(exp_data)
+
+rm(nic.q, nbi.q, m)
 ```
 
 ```{r diagnose_data_2, tidy=TRUE, echo=FALSE, fig.width=6/2.54, fig.height=6/2.54, out.width="30%", out.height="30%"}
@@ -94,7 +120,11 @@ variables <- colnames(exp_data)[2:ncol(exp_data)]
 for (variable in variables) {
   hist(exp_data[,variable], main = "", xlab = variable)
 }
+
+rm(variable, variables)
 ```
+
+## RQ1: What is the effect of fork entropy on an OSS project's external productivity?
 
 ```{r get_points, tidy=TRUE}
 get_points <- function(x, n = 3) {
@@ -129,8 +159,8 @@ get_points <- function(x, n = 3) {
 ```
 
 ```{r rq1.0, tidy=TRUE}
-rq1.model <- lmer(
-  formula = num_integrated_commits_log ~ 
+rq1.model <- glmer(
+  formula = num_integrated_commits.t ~ 
     num_forks_log_scale + 
     fork_entropy_scale:num_forks_log_scale + 
     num_files_log_scale + 
@@ -143,15 +173,22 @@ rq1.model <- lmer(
     fork_entropy_scale:ratio_old_volunteers_log_scale + 
     fork_entropy_scale + 
     (1 + num_forks_log_scale | project),
-  data = exp_data)
+  data = exp_data,
+  family = poisson(link = "log"))
 vif(rq1.model)
 summary(rq1.model)
 model_performance(rq1.model)
-performance_accuracy(rq1.model)
-anova(rq1.model)
+a <- Anova(rq1.model, type = "II")
+print(a)
+round(a$Chisq / sum(a$Chisq, na.rm = TRUE), 3)
+rm(a)
 ```
 
-```{r rq1.1, tidy=TRUE, echo=FALSE, out.width="45%", out.height="45%"}
+```{r rq1.1, tidy=TRUE, echo=FALSE, fig.width=12/2.54, fig.height=12/2.54, out.width="45%", out.height="45%"}
+check_model(rq1.model)
+```
+
+```{r rq1.2, tidy=TRUE, echo=FALSE, out.width="30%", out.height="30%"}
 num_forks_c <- get_points(exp_data$num_forks_log_scale)
 project_age_c <- get_points(exp_data$project_age_scale)
 fork_entropy_c <- get_points(exp_data$fork_entropy_scale)
@@ -159,122 +196,118 @@ fork_entropy_c <- get_points(exp_data$fork_entropy_scale)
 vary_num_forks_fix_fork_entropy <- list(
   fork_entropy_scale=fork_entropy_c,
   num_forks_log_scale=seq(
-    num_forks_c[[1]], num_forks_c[[length(num_forks_c)]], by = 0.1)
-)
-emmip(rq1.model,
-      fork_entropy_scale ~ num_forks_log_scale,
-      at = vary_num_forks_fix_fork_entropy,
-      CIs = TRUE)
-# vary_num_forks_fix_fork_entropy.data <- emmip(
-#   rq1.model,
-#   fork_entropy_scale ~ num_forks_log_scale,
-#   at = vary_num_forks_fix_fork_entropy,
-#   CIs = TRUE,
-#   plotit = FALSE)
-# write.csv(vary_num_forks_fix_fork_entropy.data,
-#           file = "vary_num_forks_fix_fork_entropy.csv",
-#           row.names = FALSE,
-#           fileEncoding = "UTF-8")
+    num_forks_c[[1]], num_forks_c[[length(num_forks_c)]], by = 0.1))
+emmip(rq1.model, fork_entropy_scale ~ num_forks_log_scale,
+      at = vary_num_forks_fix_fork_entropy)
+vary_num_forks_fix_fork_entropy.data <- emmip(
+  rq1.model, fork_entropy_scale ~ num_forks_log_scale,
+  at = vary_num_forks_fix_fork_entropy, plotit = FALSE)
+write.csv(vary_num_forks_fix_fork_entropy.data,
+          file = "rq1_vary_num_forks_fix_fork_entropy.csv",
+          row.names = FALSE, fileEncoding = "UTF-8")
 
 vary_project_age_fix_fork_entropy <- list(
   fork_entropy_scale=fork_entropy_c,
   project_age_scale=seq(
-    project_age_c[[1]], project_age_c[[length(project_age_c)]], by = 0.1)
-)
-emmip(rq1.model,
-      fork_entropy_scale ~ project_age_scale,
-      at = vary_project_age_fix_fork_entropy,
-      CIs = TRUE)
-# vary_project_age_fix_fork_entropy.data <- emmip(
-#   rq1.model,
-#   fork_entropy_scale ~ project_age_scale,
-#   at = vary_project_age_fix_fork_entropy,
-#   CIs = TRUE,
-#   plotit = FALSE)
-# write.csv(vary_project_age_fix_fork_entropy.data,
-#           file = "vary_project_age_fix_fork_entropy.csv",
-#           row.names = FALSE,
-#           fileEncoding = "UTF-8")
+    project_age_c[[1]], project_age_c[[length(project_age_c)]], by = 0.1))
+emmip(rq1.model, fork_entropy_scale ~ project_age_scale,
+      at = vary_project_age_fix_fork_entropy)
+vary_project_age_fix_fork_entropy.data <- emmip(
+  rq1.model, fork_entropy_scale ~ project_age_scale,
+  at = vary_project_age_fix_fork_entropy, plotit = FALSE)
+write.csv(vary_project_age_fix_fork_entropy.data,
+          file = "rq1_vary_project_age_fix_fork_entropy.csv",
+          row.names = FALSE, fileEncoding = "UTF-8")
+
+rm(num_forks_c, project_age_c, fork_entropy_c,
+   vary_num_forks_fix_fork_entropy, vary_num_forks_fix_fork_entropy.data,
+   vary_project_age_fix_fork_entropy, vary_project_age_fix_fork_entropy.data)
 ```
+
+## RQ2: How does fork entropy influence the acceptance rate of external pull-requests?
 
 ```{r rq2.0, tidy=TRUE}
 rq2.model <- glmer(
   formula = ratio_merged_prs ~ 
     num_forks_rq2_log_scale + 
+    # fork_entropy_rq2_scale:num_forks_rq2_log_scale + 
     num_files_rq2_log_scale + 
+    fork_entropy_rq2_scale:num_files_rq2_log_scale + 
     project_age_scale + 
     fork_entropy_rq2_scale:project_age_scale + 
     ratio_old_volunteers_rq2_log_scale + 
     fork_entropy_rq2_scale:ratio_old_volunteers_rq2_log_scale + 
     ratio_prs_with_tests_scale + 
     fork_entropy_rq2_scale:ratio_prs_with_tests_scale + 
-    ratio_prs_with_hot_files_log_scale + 
-    fork_entropy_rq2_scale:ratio_prs_with_hot_files_log_scale + 
+    ratio_prs_with_hot_files_scale + 
+    fork_entropy_rq2_scale:ratio_prs_with_hot_files_scale + 
     fork_entropy_rq2_scale + 
     (1 + num_forks_rq2_log_scale | project),
   data = exp_data,
   weights = num_closed_prs,
-  family = "binomial")
+  family = binomial(link = "logit"))
 vif(rq2.model)
 summary(rq2.model)
 model_performance(rq2.model)
 performance_accuracy(rq2.model)
-Anova(rq2.model, type="II")
+a <- Anova(rq2.model, type = "II")
+print(a)
+round(a$Chisq / sum(a$Chisq, na.rm = TRUE), 3)
+rm(a)
 ```
 
-```{r rq2.1, tidy=TRUE, echo=FALSE, out.width="45%", out.height="45%"}
+```{r rq2.1, tidy=TRUE, echo=FALSE, fig.width=12/2.54, fig.height=12/2.54, out.width="45%", out.height="45%"}
+check_model(rq2.model)
+```
+
+```{r rq2.2, tidy=TRUE, echo=FALSE, out.width="45%", out.height="45%"}
 ratio_prs_with_tests_c  <- get_points(exp_data$ratio_prs_with_tests_scale)
-ratio_prs_with_hot_files_c  <- get_points(exp_data$ratio_prs_with_hot_files_log_scale)
+ratio_prs_with_hot_files_scale_c <- get_points(exp_data$ratio_prs_with_hot_files_scale)
 fork_entropy_rq2_c <- get_points(exp_data$fork_entropy_rq2_scale)
 
 vary_ratio_prs_with_tests_fix_fork_entropy <- list(
   fork_entropy_rq2_scale=fork_entropy_rq2_c,
   ratio_prs_with_tests_scale=seq(
     ratio_prs_with_tests_c[[1]],
-    ratio_prs_with_tests_c[[length(ratio_prs_with_tests_c)]],
-    by = 0.1)
-)
+    ratio_prs_with_tests_c[[length(ratio_prs_with_tests_c)]], by = 0.1))
 emmip(rq2.model,
       fork_entropy_rq2_scale ~ ratio_prs_with_tests_scale,
-      at = vary_ratio_prs_with_tests_fix_fork_entropy,
-      CIs = TRUE)
-# vary_ratio_prs_with_tests_fix_fork_entropy.data <- emmip(
-#   rq2.model,
-#   fork_entropy_rq2_scale ~ ratio_prs_with_tests_scale,
-#   at = vary_ratio_prs_with_tests_fix_fork_entropy,
-#   CIs = TRUE,
-#   plotit = FALSE)
-# write.csv(vary_ratio_prs_with_tests_fix_fork_entropy.data,
-#           file = "vary_ratio_prs_with_tests_fix_fork_entropy.csv",
-#           row.names = FALSE,
-#           fileEncoding = "UTF-8")
+      at = vary_ratio_prs_with_tests_fix_fork_entropy)
+vary_ratio_prs_with_tests_fix_fork_entropy.data <- emmip(
+  rq2.model, fork_entropy_rq2_scale ~ ratio_prs_with_tests_scale,
+  at = vary_ratio_prs_with_tests_fix_fork_entropy, plotit = FALSE)
+write.csv(vary_ratio_prs_with_tests_fix_fork_entropy.data,
+          file = "rq2_vary_ratio_prs_with_tests_fix_fork_entropy.csv",
+          row.names = FALSE, fileEncoding = "UTF-8")
 
 vary_ratio_prs_with_hot_files_fix_fork_entropy <- list(
   fork_entropy_rq2_scale=fork_entropy_rq2_c,
-  ratio_prs_with_hot_files_log_scale=seq(
-    ratio_prs_with_hot_files_c[[1]],
-    ratio_prs_with_hot_files_c[[length(ratio_prs_with_hot_files_c)]],
-    by = 0.1)
-)
+  ratio_prs_with_hot_files_scale=seq(
+    ratio_prs_with_hot_files_scale_c[[1]],
+    ratio_prs_with_hot_files_scale_c[[length(ratio_prs_with_hot_files_scale_c)]],
+    by = 0.1))
 emmip(rq2.model,
-      fork_entropy_rq2_scale ~ ratio_prs_with_hot_files_log_scale,
-      at = vary_ratio_prs_with_hot_files_fix_fork_entropy,
-      CIs = TRUE)
-# vary_ratio_prs_with_hot_files_fix_fork_entropy.data <- emmip(
-#   rq2.model,
-#   fork_entropy_rq2_scale ~ ratio_prs_with_hot_files_log_scale,
-#   at = vary_ratio_prs_with_hot_files_fix_fork_entropy,
-#   CIs = TRUE,
-#   plotit = FALSE)
-# write.csv(vary_ratio_prs_with_hot_files_fix_fork_entropy.data,
-#           file = "vary_ratio_prs_with_hot_files_fix_fork_entropy.csv",
-#           row.names = FALSE,
-#           fileEncoding = "UTF-8")
+      fork_entropy_rq2_scale ~ ratio_prs_with_hot_files_scale,
+      at = vary_ratio_prs_with_hot_files_fix_fork_entropy)
+vary_ratio_prs_with_hot_files_fix_fork_entropy.data <- emmip(
+  rq2.model, fork_entropy_rq2_scale ~ ratio_prs_with_hot_files_scale,
+  at = vary_ratio_prs_with_hot_files_fix_fork_entropy, plotit = FALSE)
+write.csv(vary_ratio_prs_with_hot_files_fix_fork_entropy.data,
+          file = "rq2_vary_ratio_prs_with_hot_files_fix_fork_entropy.csv",
+          row.names = FALSE, fileEncoding = "UTF-8")
+
+rm(ratio_prs_with_tests_c, ratio_prs_with_hot_files_scale_c, fork_entropy_rq2_c,
+   vary_ratio_prs_with_tests_fix_fork_entropy,
+   vary_ratio_prs_with_tests_fix_fork_entropy.data,
+   vary_ratio_prs_with_hot_files_fix_fork_entropy,
+   vary_ratio_prs_with_hot_files_fix_fork_entropy.data)
 ```
 
+## RQ3: What is the correlation between fork entropy and OSS projects' code quality?
+
 ```{r rq3.0, tidy=TRUE}
-rq3.model <- lmer(
-  formula = num_bug_report_issues_log ~ 
+rq3.model <- glmer(
+  formula = num_bug_report_issues.t ~ 
     num_forks_log_scale + 
     fork_entropy_scale:num_forks_log_scale + 
     num_files_log_scale + 
@@ -285,10 +318,38 @@ rq3.model <- lmer(
     fork_entropy_scale:num_stars_log_scale + 
     fork_entropy_scale + 
     (1 + num_forks_log_scale | project),
-  data = exp_data)
+  data = exp_data,
+  family = poisson(link = "log"))
 vif(rq3.model)
 summary(rq3.model)
 model_performance(rq3.model)
-performance_accuracy(rq3.model)
-anova(rq3.model)
+a <- Anova(rq3.model, type = "II")
+print(a)
+round(a$Chisq / sum(a$Chisq, na.rm = TRUE), 3)
+rm(a)
+```
+
+```{r rq3.1, tidy=TRUE, echo=FALSE, fig.width=12/2.54, fig.height=12/2.54, out.width="45%", out.height="45%"}
+check_model(rq3.model)
+```
+
+```{r rq3.2, tidy=TRUE, echo=FALSE, out.width="45%", out.height="45%"}
+num_forks_c <- get_points(exp_data$num_forks_log_scale)
+fork_entropy_c <- get_points(exp_data$fork_entropy_scale)
+
+vary_num_forks_fix_fork_entropy <- list(
+  fork_entropy_scale=fork_entropy_c,
+  num_forks_log_scale=seq(
+    num_forks_c[[1]], num_forks_c[[length(num_forks_c)]], by = 0.1))
+emmip(rq3.model, fork_entropy_scale ~ num_forks_log_scale,
+      at = vary_num_forks_fix_fork_entropy)
+vary_num_forks_fix_fork_entropy.data <- emmip(
+  rq3.model, fork_entropy_scale ~ num_forks_log_scale,
+  at = vary_num_forks_fix_fork_entropy, plotit = FALSE)
+write.csv(vary_num_forks_fix_fork_entropy.data,
+          file = "rq3_vary_num_forks_fix_fork_entropy.csv",
+          row.names = FALSE, fileEncoding = "UTF-8")
+
+rm(num_forks_c, fork_entropy_c, vary_num_forks_fix_fork_entropy,
+   vary_num_forks_fix_fork_entropy.data)
 ```
